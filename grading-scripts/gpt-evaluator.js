@@ -120,6 +120,38 @@ async function evaluateWithGPT() {
   return evaluation;
 }
 
+// Retry helper for transient errors
+async function retryWithBackoff(fn, maxAttempts = 3) {
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    try {
+      return await fn();
+    } catch (error) {
+      attempt++;
+      
+      // Check if error is transient (network issues or server errors)
+      const isTransient = 
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ECONNREFUSED' ||
+        (error.status >= 500 && error.status < 600) ||
+        error.message?.includes('ECONNRESET') ||
+        error.message?.includes('ETIMEDOUT');
+      
+      // Don't retry non-transient errors (auth, rate limit, etc.)
+      if (!isTransient || attempt === maxAttempts) {
+        throw error;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = Math.pow(2, attempt) * 1000 + Math.floor(Math.random() * 1000);
+      console.error(`   ⚠️  Transient error, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function evaluateCriterion(criterion, codeSummaries, unitTestResults, rubric) {
   const isHybrid = criterion.evaluation_method === 'hybrid';
   
@@ -167,20 +199,23 @@ Provide your response in JSON format:
 }`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are an expert full-stack development instructor evaluating student projects. Provide fair, constructive feedback with specific examples.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      temperature: 0.3,
-      response_format: { type: 'json_object' }
+    // Wrap OpenAI call with retry logic for transient errors
+    const response = await retryWithBackoff(async () => {
+      return await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an expert full-stack development instructor evaluating student projects. Provide fair, constructive feedback with specific examples.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.3,
+        response_format: { type: 'json_object' }
+      });
     });
 
     const gptResponse = JSON.parse(response.choices[0].message.content);
@@ -220,7 +255,30 @@ Provide your response in JSON format:
       ...(isHybrid && { hybrid_calculation: gptResponse.hybrid_calculation })
     };
   } catch (error) {
-    throw new Error(`GPT API error: ${error.message}`);
+    // Enhanced error logging
+    console.error(`   ⚠️  Full error details:`, {
+      message: error.message,
+      name: error.name,
+      code: error.code,
+      type: error.type,
+      status: error.status,
+      statusText: error.statusText
+    });
+    
+    // Check for common error types
+    if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+      throw new Error(`Network error: Cannot reach OpenAI API (${error.code}). Check internet connection and firewall settings.`);
+    } else if (error.status === 401 || error.message?.includes('401')) {
+      throw new Error(`Authentication error: Invalid or missing OPENAI_API_KEY. Check that your API key is set correctly in GitHub secrets.`);
+    } else if (error.status === 429 || error.message?.includes('429')) {
+      throw new Error(`Rate limit error: Too many requests to OpenAI API. Wait and retry, or check your API quota.`);
+    } else if (error.status === 402 || error.message?.includes('insufficient_quota')) {
+      throw new Error(`Quota exceeded: Your OpenAI API account has insufficient credits. Add credits at https://platform.openai.com/account/billing`);
+    } else if (error.status >= 500) {
+      throw new Error(`OpenAI server error (${error.status}): The API is experiencing issues. Check https://status.openai.com`);
+    } else {
+      throw new Error(`GPT API error: ${error.message || 'Unknown error'}`);
+    }
   }
 }
 

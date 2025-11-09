@@ -8,17 +8,44 @@ const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+// Validate API key before initializing client
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ CRITICAL ERROR: OPENAI_API_KEY environment variable not set');
+  console.error('\n📖 Setup Instructions:');
+  console.error('1. Get your API key from https://platform.openai.com/api-keys');
+  console.error('2. Add it to GitHub Secrets:');
+  console.error('   - Go to: Settings → Secrets and variables → Actions');
+  console.error('   - Click "New repository secret"');
+  console.error('   - Name: OPENAI_API_KEY');
+  console.error('   - Value: Your API key (starts with sk-)');
+  console.error('\n📄 See OPENAI_API_KEY_SETUP.md for detailed instructions\n');
+  process.exit(1);
+}
+
+if (process.env.OPENAI_API_KEY.trim().length < 20) {
+  console.error('❌ CRITICAL ERROR: OPENAI_API_KEY appears to be invalid (too short)');
+  console.error('   Current length:', process.env.OPENAI_API_KEY.length, 'characters');
+  console.error('   Expected: At least 20 characters starting with "sk-"');
+  console.error('   First 10 chars:', process.env.OPENAI_API_KEY.substring(0, 10) + '...');
+  process.exit(1);
+}
+
+let openai;
+try {
+  openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY
+  });
+  console.error('✅ OpenAI client initialized successfully');
+  console.error('   API Key prefix:', process.env.OPENAI_API_KEY.substring(0, 7) + '...\n');
+} catch (error) {
+  console.error('❌ CRITICAL ERROR: Failed to initialize OpenAI client');
+  console.error('   Error:', error.message);
+  console.error('   This usually means the openai package is not installed or there\'s a configuration issue.');
+  process.exit(1);
+}
 
 async function evaluateWithGPT() {
   console.error('🤖 Starting GPT-4o Evaluation...\n');
-
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('❌ OPENAI_API_KEY environment variable not set');
-    process.exit(1);
-  }
 
   // Load rubric
   const rubric = JSON.parse(fs.readFileSync('rubric.json', 'utf8'));
@@ -255,29 +282,45 @@ Provide your response in JSON format:
       ...(isHybrid && { hybrid_calculation: gptResponse.hybrid_calculation })
     };
   } catch (error) {
-    // Enhanced error logging
+    // Enhanced error logging with full inspection
     console.error(`   ⚠️  Full error details:`, {
       message: error.message,
       name: error.name,
       code: error.code,
       type: error.type,
       status: error.status,
-      statusText: error.statusText
+      statusText: error.statusText,
+      cause: error.cause?.message || error.cause,
+      stack: error.stack?.split('\n').slice(0, 3).join('\n')
     });
+    
+    // Log the error object keys to see what properties are available
+    console.error(`   🔍 Error properties:`, Object.keys(error));
+    
+    // If it's an OpenAI API error, it might have nested error info
+    if (error.error) {
+      console.error(`   🔍 Nested error:`, error.error);
+    }
     
     // Check for common error types
     if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
       throw new Error(`Network error: Cannot reach OpenAI API (${error.code}). Check internet connection and firewall settings.`);
-    } else if (error.status === 401 || error.message?.includes('401')) {
-      throw new Error(`Authentication error: Invalid or missing OPENAI_API_KEY. Check that your API key is set correctly in GitHub secrets.`);
+    } else if (error.status === 401 || error.message?.includes('401') || error.message?.includes('Incorrect API key')) {
+      throw new Error(`Authentication error: Invalid OPENAI_API_KEY. The API key is either missing, incorrect, or expired. Check GitHub secrets.`);
     } else if (error.status === 429 || error.message?.includes('429')) {
       throw new Error(`Rate limit error: Too many requests to OpenAI API. Wait and retry, or check your API quota.`);
     } else if (error.status === 402 || error.message?.includes('insufficient_quota')) {
       throw new Error(`Quota exceeded: Your OpenAI API account has insufficient credits. Add credits at https://platform.openai.com/account/billing`);
     } else if (error.status >= 500) {
       throw new Error(`OpenAI server error (${error.status}): The API is experiencing issues. Check https://status.openai.com`);
+    } else if (error.message === 'Connection error.') {
+      // This is the generic error we're seeing - it means the SDK couldn't connect
+      throw new Error(`Connection failed: The OpenAI SDK could not establish a connection. This usually means:\n` +
+        `   1. OPENAI_API_KEY is invalid/expired - Check your API key at https://platform.openai.com/api-keys\n` +
+        `   2. Network/firewall is blocking the connection - Check internet and proxy settings\n` +
+        `   3. OpenAI service is down - Check https://status.openai.com`);
     } else {
-      throw new Error(`GPT API error: ${error.message || 'Unknown error'}`);
+      throw new Error(`GPT API error: ${error.message || 'Unknown error'}. See error details above for more info.`);
     }
   }
 }

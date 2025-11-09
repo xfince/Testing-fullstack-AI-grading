@@ -1,0 +1,487 @@
+name: Grade Student Submission
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub Actions UI
+    inputs:
+      student_repo:
+        description: 'Student repository name (optional - defaults to current repo)'
+        required: false
+        type: string
+      debug_mode:
+        description: 'Enable debug logging'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  grade-submission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # Maximum 60 minutes for entire grading process
+    
+    steps:
+      # ============================================
+      # STEP 1: CHECKOUT & SETUP
+      # ============================================
+      - name: 📥 Checkout Student Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history for git analysis
+      
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: 🗄️ Setup MongoDB
+        uses: supercharge/mongodb-github-action@1.10.0
+        with:
+          mongodb-version: '7.0'
+          mongodb-replica-set: test-rs
+      
+      - name: 🔧 Install System Dependencies
+        run: |
+          echo "Installing jq for JSON processing..."
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+      
+      # ============================================
+      # STEP 2: VALIDATE SUBMISSION
+      # ============================================
+      - name: 📋 Validate Required Files
+        id: validate
+        run: |
+          echo "🔍 Checking for required files and folders..."
+          
+          # Check for grading folder
+          if [ ! -d "grading-folder" ]; then
+            echo "❌ ERROR: grading-folder/ directory not found"
+            echo "validation_failed=true" >> $GITHUB_OUTPUT
+            echo "error_message=Missing grading-folder directory" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check for frontend folder
+          if [ ! -d "grading-folder/frontend" ]; then
+            echo "⚠️  WARNING: grading-folder/frontend/ not found"
+            echo "missing_frontend=true" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check for backend folder
+          if [ ! -d "grading-folder/backend" ]; then
+            echo "⚠️  WARNING: grading-folder/backend/ not found"
+            echo "missing_backend=true" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check for deployment URL
+          if [ ! -f "DEPLOYMENT_URL.txt" ]; then
+            echo "⚠️  WARNING: DEPLOYMENT_URL.txt not found"
+            echo "missing_deployment_url=true" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check for package.json files
+          if [ ! -f "package.json" ]; then
+            echo "⚠️  WARNING: Root package.json not found"
+            echo "missing_root_package=true" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "✅ Validation complete"
+          echo "validation_failed=false" >> $GITHUB_OUTPUT
+      
+      # ============================================
+      # STEP 3: INSTALL DEPENDENCIES
+      # ============================================
+      - name: 📦 Install Root Dependencies
+        if: steps.validate.outputs.validation_failed != 'true'
+        run: |
+          echo "📦 Installing root dependencies..."
+          if [ -f "package.json" ]; then
+            npm install || echo "⚠️  Root npm install failed"
+          fi
+      
+      - name: 📦 Install Grading Script Dependencies
+        run: |
+          echo "📦 Installing grading script dependencies..."
+          cd grading-scripts
+          npm install
+          cd ..
+      
+      - name: 📦 Install Frontend Dependencies
+        if: steps.validate.outputs.validation_failed != 'true' && steps.validate.outputs.missing_frontend != 'true'
+        continue-on-error: true
+        run: |
+          echo "📦 Installing frontend dependencies..."
+          if [ -f "package.json" ]; then
+            npm install --legacy-peer-deps || echo "⚠️  Frontend dependencies installation had issues"
+          fi
+      
+      - name: 📦 Install Backend Dependencies
+        if: steps.validate.outputs.validation_failed != 'true' && steps.validate.outputs.missing_backend != 'true'
+        continue-on-error: true
+        run: |
+          echo "📦 Installing backend dependencies..."
+          if [ -d "server" ] && [ -f "server/package.json" ]; then
+            cd server && npm install --legacy-peer-deps || echo "⚠️  Backend dependencies installation had issues"
+            cd ..
+          elif [ -d "backend" ] && [ -f "backend/package.json" ]; then
+            cd backend && npm install --legacy-peer-deps || echo "⚠️  Backend dependencies installation had issues"
+            cd ..
+          fi
+      
+      # ============================================
+      # STEP 4: BUILD PROJECT
+      # ============================================
+      - name: 🏗️  Build Frontend
+        id: build_frontend
+        if: steps.validate.outputs.validation_failed != 'true'
+        continue-on-error: true
+        run: |
+          echo "🏗️  Building frontend..."
+          
+          # Create .env.local for build if needed
+          if [ ! -f ".env.local" ]; then
+            echo "Creating temporary .env.local for build..."
+            cat > .env.local << EOF
+          NEXT_PUBLIC_API_URL=http://localhost:5000
+          NODE_ENV=production
+          EOF
+          fi
+          
+          # Try to build
+          npm run build 2>&1 | tee build.log || {
+            echo "❌ Build failed"
+            echo "build_failed=true" >> $GITHUB_OUTPUT
+            echo "build_error<<EOF" >> $GITHUB_OUTPUT
+            tail -50 build.log >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
+          }
+          
+          echo "✅ Build successful"
+          echo "build_failed=false" >> $GITHUB_OUTPUT
+      
+      - name: 📊 Build Status Summary
+        run: |
+          echo "## 🏗️  Build Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.build_frontend.outputs.build_failed }}" == "true" ]; then
+            echo "❌ **Build Failed**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Error Details:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ steps.build_frontend.outputs.build_error }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **Build Successful**" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      # ============================================
+      # STEP 5: SETUP TEST ENVIRONMENT
+      # ============================================
+      - name: 🔧 Setup Test Environment
+        if: steps.validate.outputs.validation_failed != 'true'
+        run: |
+          echo "🔧 Setting up test environment..."
+          
+          # Create test .env file
+          cat > .env.test << EOF
+          NODE_ENV=test
+          MONGODB_URI=mongodb://localhost:27017/test_db
+          JWT_SECRET=test_secret_key_for_grading_123456
+          PORT=5000
+          FRONTEND_URL=http://localhost:3000
+          EOF
+          
+          # Copy to various locations where it might be needed
+          cp .env.test .env || true
+          cp .env.test server/.env 2>/dev/null || true
+          cp .env.test backend/.env 2>/dev/null || true
+          
+          echo "✅ Test environment ready"
+      
+      - name: � Install MongoDB Driver for Testing
+        run: |
+          echo "📦 Installing mongodb package for connection test..."
+          npm install mongodb --no-save
+      
+      - name: ️  Verify MongoDB Connection
+        continue-on-error: true
+        run: |
+          echo "🗄️  Testing MongoDB connection..."
+          node -e "
+            const { MongoClient } = require('mongodb');
+            const client = new MongoClient('mongodb://localhost:27017');
+            client.connect()
+              .then(() => {
+                console.log('✅ MongoDB connection successful');
+                return client.close();
+              })
+              .catch(err => {
+                console.error('❌ MongoDB connection failed:', err.message);
+                process.exit(1);
+              });
+          "
+      
+      # ============================================
+      # STEP 6: RUN UNIT TESTS
+      # ============================================
+      - name: 🧪 Run Unit Tests
+        id: unit_tests
+        if: steps.validate.outputs.validation_failed != 'true'
+        continue-on-error: true
+        env:
+          NODE_ENV: test
+          MONGODB_URI: mongodb://localhost:27017/test_db
+          JWT_SECRET: test_secret_key_for_grading_123456
+        run: |
+          echo "🧪 Running unit tests..." >&2
+          node grading-scripts/run-unit-tests.js > unit-test-results.json
+          
+          # Check if tests ran successfully
+          if [ $? -eq 0 ]; then
+            echo "unit_tests_completed=true" >> $GITHUB_OUTPUT
+          else
+            echo "unit_tests_completed=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Display summary
+          if [ -f "unit-test-results.json" ]; then
+            echo "## 🧪 Unit Test Results" >> $GITHUB_STEP_SUMMARY
+            node -e "
+              const results = require('./unit-test-results.json');
+              console.log('**Total Tests:** ' + results.total);
+              console.log('**Passed:** ' + results.passed + ' ✅');
+              console.log('**Failed:** ' + results.failed + ' ❌');
+              console.log('**Success Rate:** ' + results.successRate + '%');
+            " >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      # ============================================
+      # STEP 7: ANALYZE GIT HISTORY
+      # ============================================
+      - name: 📜 Analyze Git History
+        id: git_analysis
+        if: steps.validate.outputs.validation_failed != 'true'
+        run: |
+          echo "📜 Analyzing git commit history..." >&2
+          node grading-scripts/analyze-git-history.js > git-analysis.json
+          
+          echo "## 📜 Git History Analysis" >> $GITHUB_STEP_SUMMARY
+          if [ -f "git-analysis.json" ] && jq empty git-analysis.json 2>/dev/null; then
+            node -e "
+              const analysis = require('./git-analysis.json');
+              console.log('**Total Commits:** ' + analysis.total_commits);
+              console.log('**Commit Frequency:** ' + analysis.commit_frequency);
+              console.log('**Meaningful Messages:** ' + analysis.commit_message_quality.meaningful);
+              console.log('**Vague Messages:** ' + analysis.commit_message_quality.vague);
+            " >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Git analysis output invalid or missing" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      # ============================================
+      # STEP 8: CODE ANALYSIS & SUMMARIZATION
+      # ============================================
+      - name: 📝 Summarize Code for GPT Analysis
+        id: code_summary
+        if: steps.validate.outputs.validation_failed != 'true'
+        run: |
+          echo "📝 Generating code summaries..." >&2
+          node grading-scripts/code-summarizer.js > code-summaries.json
+          
+          # Check file size and validity
+          if [ -f "code-summaries.json" ] && jq empty code-summaries.json 2>/dev/null; then
+            summary_size=$(wc -c < code-summaries.json)
+            echo "📊 Code summary size: $summary_size bytes" >&2
+            echo "✅ Code summary generated successfully" >&2
+            echo "code_summary_completed=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Code summary generation failed or produced invalid JSON" >&2
+            if [ -f "code-summaries.json" ]; then
+              echo "First 500 chars of output:" >&2
+              head -c 500 code-summaries.json >&2
+            fi
+            echo "code_summary_completed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # ============================================
+      # STEP 9: GPT-4O EVALUATION
+      # ============================================
+      - name: 🤖 GPT-4o Code Evaluation
+        id: gpt_evaluation
+        if: steps.validate.outputs.validation_failed != 'true' && steps.code_summary.outputs.code_summary_completed == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "🤖 Running GPT-4o evaluation..." >&2
+          
+          # Check if API key exists
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "❌ ERROR: OPENAI_API_KEY not set in repository secrets" >&2
+            echo "gpt_evaluation_failed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Run GPT evaluation (stdout to file, stderr to terminal for logging)
+          node grading-scripts/gpt-evaluator.js > gpt-evaluation.json
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -eq 0 ] && [ -f "gpt-evaluation.json" ]; then
+            # Verify JSON is valid
+            if jq empty gpt-evaluation.json 2>/dev/null; then
+              echo "✅ GPT evaluation completed" >&2
+              echo "gpt_evaluation_completed=true" >> $GITHUB_OUTPUT
+              
+              # Add summary
+              echo "## 🤖 GPT-4o Evaluation" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Evaluation completed successfully" >> $GITHUB_STEP_SUMMARY
+              
+              # Show API usage
+              api_calls=$(jq '.metadata.total_api_calls // 0' gpt-evaluation.json)
+              echo "**API Calls Made:** $api_calls" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ GPT evaluation produced invalid JSON" >&2
+              echo "First 500 chars of output:" >&2
+              head -c 500 gpt-evaluation.json >&2
+              echo "gpt_evaluation_completed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "❌ GPT evaluation failed with exit code $EXIT_CODE" >&2
+            echo "gpt_evaluation_completed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # ============================================
+      # STEP 10: TEST DEPLOYMENT
+      # ============================================
+      - name: 🌐 Test Deployment URL
+        id: deployment_test
+        if: steps.validate.outputs.validation_failed != 'true' && steps.validate.outputs.missing_deployment_url != 'true'
+        continue-on-error: true
+        run: |
+          echo "🌐 Testing deployment URL..."
+          
+          if [ -f "DEPLOYMENT_URL.txt" ]; then
+            DEPLOY_URL=$(cat DEPLOYMENT_URL.txt | tr -d '\r\n' | xargs)
+            echo "Testing URL: $DEPLOY_URL"
+            
+            # Install Playwright if not already installed
+            npx playwright install chromium --with-deps
+            
+            # Run deployment tests
+            node grading-scripts/test-deployment.js "$DEPLOY_URL" > deployment-test.json
+            
+            if [ $? -eq 0 ]; then
+              echo "deployment_test_completed=true" >> $GITHUB_OUTPUT
+              echo "## 🌐 Deployment Test" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Deployment URL is accessible" >> $GITHUB_STEP_SUMMARY
+              echo "**URL:** $DEPLOY_URL" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "deployment_test_completed=false" >> $GITHUB_OUTPUT
+              echo "## 🌐 Deployment Test" >> $GITHUB_STEP_SUMMARY
+              echo "❌ Deployment URL test failed" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️  No deployment URL found"
+            echo "deployment_test_completed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # ============================================
+      # STEP 11: GENERATE FINAL REPORT
+      # ============================================
+      - name: 📊 Generate Final Grading Report
+        id: generate_report
+        if: always()
+        env:
+          VALIDATION_FAILED: ${{ steps.validate.outputs.validation_failed }}
+          BUILD_FAILED: ${{ steps.build_frontend.outputs.build_failed }}
+          UNIT_TESTS_COMPLETED: ${{ steps.unit_tests.outputs.unit_tests_completed }}
+          GPT_EVALUATION_COMPLETED: ${{ steps.gpt_evaluation.outputs.gpt_evaluation_completed }}
+          DEPLOYMENT_TEST_COMPLETED: ${{ steps.deployment_test.outputs.deployment_test_completed }}
+        run: |
+          echo "📊 Generating final grading report..."
+          
+          # Generate comprehensive report
+          node grading-scripts/generate-report.js \
+            --unit-tests=unit-test-results.json \
+            --git-analysis=git-analysis.json \
+            --code-summaries=code-summaries.json \
+            --gpt-evaluation=gpt-evaluation.json \
+            --deployment-test=deployment-test.json \
+            --rubric=rubric.json \
+            --output=GRADING_REPORT.md
+          
+          if [ -f "GRADING_REPORT.md" ]; then
+            echo "✅ Report generated successfully"
+            echo "report_generated=true" >> $GITHUB_OUTPUT
+            
+            # Display report summary in job summary
+            echo "# 📊 Grading Report Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Extract key information from report
+            if command -v grep &> /dev/null; then
+              grep "^## Executive Summary" -A 5 GRADING_REPORT.md >> $GITHUB_STEP_SUMMARY || true
+              echo "" >> $GITHUB_STEP_SUMMARY
+              grep "^**Total Score:**" GRADING_REPORT.md >> $GITHUB_STEP_SUMMARY || true
+              grep "^**Grade:**" GRADING_REPORT.md >> $GITHUB_STEP_SUMMARY || true
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📄 **Full report available in artifacts**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Report generation failed"
+            echo "report_generated=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # ============================================
+      # STEP 12: UPLOAD ARTIFACTS
+      # ============================================
+      - name: 📤 Upload Grading Report
+        if: always() && steps.generate_report.outputs.report_generated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: grading-report-${{ github.run_number }}
+          path: GRADING_REPORT.md
+          retention-days: 90
+      
+      - name: 📤 Upload Detailed Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grading-details-${{ github.run_number }}
+          path: |
+            unit-test-results.json
+            git-analysis.json
+            code-summaries.json
+            gpt-evaluation.json
+            deployment-test.json
+            build.log
+          retention-days: 90
+      
+      # ============================================
+      # STEP 13: FINAL STATUS
+      # ============================================
+      - name: 🎯 Grading Complete
+        if: always()
+        run: |
+          echo "======================================"
+          echo "🎯 GRADING COMPLETE"
+          echo "======================================"
+          echo ""
+          
+          if [ "${{ steps.generate_report.outputs.report_generated }}" == "true" ]; then
+            echo "✅ Grading report generated successfully"
+            echo "📄 Download the report from the Artifacts section"
+            echo ""
+            
+            # Display quick stats
+            if [ -f "GRADING_REPORT.md" ]; then
+              echo "Quick Stats:"
+              grep "^**Total Score:**" GRADING_REPORT.md || echo "Score: See report"
+              grep "^**Grade:**" GRADING_REPORT.md || echo "Grade: See report"
+            fi
+          else
+            echo "⚠️  Grading completed with issues"
+            echo "Please check the logs and artifacts for details"
+          fi
+          
+          echo ""
+          echo "======================================"

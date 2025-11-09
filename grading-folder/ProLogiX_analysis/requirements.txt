@@ -1,0 +1,15 @@
+# requirements.txt
+
+# Core dependencies
+Flask
+flask-cors
+
+# Transformers and NLP
+transformers
+torch  
+sentencepiece  # Required by BART and some other models
+
+
+# Development
+python-dotenv  
+gunicorn
